@@ -1,0 +1,149 @@
+name: 1.0.$(myBuildCounter)
+
+variables:
+- group: "NuGet Feed credentials"
+- name: myBuildCounter
+  value: $[counter('buildCounter',1)]
+
+trigger:
+  batch: true
+  branches:
+    include:
+    - master
+    - /*
+
+  paths:
+    include:
+    - MainDirectory/*
+    - SharedLibraries/*
+
+jobs:
+- job: build
+  displayName: Build & Test
+  condition: succeeded()
+  pool:
+    name: Hosted Ubuntu 1604
+    demands: npm
+
+  steps:
+  # Create Publish Folder
+  - task: CmdLine@2
+    displayName: 'Create publish folder'
+    inputs:
+     script: 'mkdir -p $(Build.SourcesDirectory)/publish'
+
+  # Copy Terraform files to publish folder
+  - task: CopyFiles@2
+    displayName: 'Copy terraform files'
+    inputs:
+      SourceFolder: MainDirectory/deployment/terraform
+      Contents: |
+        *.tf
+        *.tfvars
+      TargetFolder: $(Build.SourcesDirectory)/publish
+
+  #### Solution1 ####
+    #restore lambdas
+  - task: DotNetCoreCLI@2
+    displayName: 'Restore - Solution1'
+    inputs:
+      command: restore
+      projects: 'MainDirectory/Solution1_Directory/Solution1_ProjectName.csproj'
+      feedsToUse: config
+      nugetConfigPath: 'MainDirectory/NuGet.Config'
+
+    #restore tests
+  - task: DotNetCoreCLI@2
+    displayName: 'Restore - Solution1 Test'
+    inputs:
+      command: restore
+      projects: 'MainDirectory/Solution1_Tests_Directory/Solution1_ProjectName.Tests.csproj'
+      feedsToUse: config
+      nugetConfigPath: 'MainDirectory/NuGet.Config'
+
+    #tests
+  - task: DotNetCoreCLI@2
+    displayName: 'Test - Solution1'
+    inputs:
+      command: test
+      projects: 'MainDirectory/Solution1_Tests_Directory/Solution1_ProjectName.Tests.csproj'
+
+    #build lambdas
+  - task: DotNetCoreCLI@2
+    displayName: 'Build - Solution1'
+    inputs:
+      command: build
+      projects: 'MainDirectory/Solution1_Directory/Solution1_ProjectName.csproj'
+      arguments: '--configuration Release' 
+
+    #package everything to publish folder
+  - task: DotNetCoreCLI@2
+    displayName: 'Publish - Solution1'
+    inputs:
+      command: publish
+      projects: 'MainDirectory/Solution1_Directory/Solution1_ProjectName.csproj'
+      publishWebProjects: False
+      arguments: '--configuration $(BuildConfiguration) --output $(Build.SourcesDirectory)/publish'
+      zipAfterPublish: True
+
+
+
+    # List all files in $(Build.SourcesDirectory)/publish (sanity check)
+  - task: CmdLine@2
+    displayName: 'List all files in $(Build.SourcesDirectory)/publish before file rename'
+    inputs:
+      script: 'ls' 
+      workingDirectory: $(Build.SourcesDirectory)/publish
+
+    # Rename lambda zip file to include version number so Octopus can pick up the right file and the lambda knows which to build
+  - task: CmdLine@2
+    displayName: 'Rename Lambda Zip File With Version Number'
+    inputs:
+     script: 'mv $(Build.SourcesDirectory)/publish/Solution1.zip $(Build.SourcesDirectory)/publish/Solution1.$(Build.BuildNumber).zip'
+
+    # List all files in $(Build.SourcesDirectory)/publish (sanity check)
+  - task: CmdLine@2
+    displayName: 'List all files in $(Build.SourcesDirectory)/publish'
+    inputs:
+      script: 'ls' 
+      workingDirectory: $(Build.SourcesDirectory)/publish
+
+  # Create Octopus Package with arrifact and NuGet
+  - task: octopusdeploy.octopus-deploy-build-release-tasks.octopus-pack.OctopusPack@3
+    displayName: 'package Solution1 artifacts and terraform files'
+    inputs:
+      PackageId: SolutionPackageName
+      PackageVersion: $(Build.BuildNumber)
+      SourcePath: $(Build.SourcesDirectory)/publish
+      OutputPath: '$(Build.ArtifactStagingDirectory)'
+  
+  - task: PublishBuildArtifacts@1
+    displayName: 'publish artifact'
+    inputs:
+      ArtifactName: SolutionPackageName
+  
+  - task: NuGetCommand@2
+    displayName: 'NuGet push'
+    inputs:
+      command: push
+      publishVstsFeed: 'dev'
+
+  #release to Octopus
+- job: Release
+  displayName: Make the octopus release
+  dependsOn: build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  
+  pool:
+    name: Release
+
+  steps:
+  - task: octopusdeploy.octopus-deploy-build-release-tasks.octopus-create-release.OctopusCreateRelease@3
+    displayName: 'Create Octopus Release'
+    inputs:
+      OctoConnectedServiceName: 'Octopus'
+      ProjectName: 'SolutionPackageName' #match project name in octopus
+      ReleaseNumber: '$(Build.BuildNumber)'
+      Channel: Default
+      DeployToEnvironment: dev
+      AdditionalArguments: "--packageversion=$(Build.BuildNumber)"
